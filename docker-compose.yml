@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: retaillab
+      POSTGRES_PASSWORD: retaillab
+      POSTGRES_DB: retaillab
+    ports:
+      - "5432:5432"
+    volumes:
+      - retaillab-pg:/var/lib/postgresql/data
+volumes:
+  retaillab-pg:

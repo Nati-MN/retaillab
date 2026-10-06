@@ -1,0 +1,582 @@
+// RetailLab data model.
+//
+// Conventions
+// - Every tenant-owned row is reachable from exactly one Organization. Rows that
+//   hang off a Store inherit the tenant through Store.organizationId.
+// - Money is Decimal(14,2); percentages are stored as percent values (31.4 = 31.4%).
+// - Monthly facts use `month` = first day of the month (UTC) and are unique per store.
+// - Nullable numeric columns mean "not provided". The calculation engine never
+//   substitutes a default for a missing input.
+// - `isDemo` marks fictional/mock rows so the UI can label them.
+
+generator client {
+  provider   = "prisma-client-js"
+  engineType = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Identity & tenancy ─────────────────────────────
+
+enum Role {
+  OWNER
+  ANALYST
+  VIEWER
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime     @default(now())
+  memberships  Membership[]
+  reports      Report[]
+}
+
+model Organization {
+  id                    String    @id @default(cuid())
+  name                  String
+  industry              String
+  country               String
+  currency              String    @default("EUR")
+  isDemo                Boolean   @default(false)
+  onboardingCompletedAt DateTime?
+  createdAt             DateTime  @default(now())
+
+  // Privacy controls: what may be placed into AI context (section 36).
+  aiIncludeFinancials Boolean @default(false)
+  aiIncludeStoreNames Boolean @default(true)
+  aiIncludeResearch   Boolean @default(true)
+  aiExplanations      Boolean @default(true)
+
+  memberships     Membership[]
+  stores          Store[]
+  categories      Category[]
+  researchSources ResearchSource[]
+  researchResults ResearchResult[]
+  strategies      Strategy[]
+  scenarios       Scenario[]
+  experiments     Experiment[]
+  opportunities   Opportunity[]
+  reports         Report[]
+  knownEvents     KnownEvent[]
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  userId         String
+  organizationId String
+  role           Role         @default(OWNER)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+// ─────────────────────────────────── Stores ───────────────────────────────────
+
+enum StoreType {
+  SUPERMARKET
+  CONVENIENCE
+  DISCOUNT
+  SPECIALTY
+}
+
+model Store {
+  id             String    @id @default(cuid())
+  organizationId String
+  name           String
+  code           String
+  address        String
+  city           String
+  latitude       Float?
+  longitude      Float?
+  openingDate    DateTime? @db.Date
+  areaSqm        Float?
+  employees      Int?
+  parkingSpaces  Int?
+  type           StoreType @default(SUPERMARKET)
+  opensAt        String? // "07:30"
+  closesAt       String? // "20:00"
+  openDaysPerWeek Int?
+  isDemo         Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+
+  organization     Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  monthlyRevenue   MonthlyRevenue[]
+  metrics          StoreMetric[]
+  categoryMetrics  CategoryMetric[]
+  costs            Cost[]
+  competitors      Competitor[]
+  locationSignals  LocationSignal[]
+  researchResults  ResearchResult[]
+  strategies       Strategy[]
+  scenarios        Scenario[]
+  testExperiments  Experiment[]     @relation("TestStore")
+  ctrlExperiments  Experiment[]     @relation("ControlStore")
+  opportunities    Opportunity[]
+  knownEvents      KnownEvent[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+}
+
+/// One row per store and month. Revenue is required; everything else is optional.
+model MonthlyRevenue {
+  id             String   @id @default(cuid())
+  storeId        String
+  month          DateTime @db.Date
+  revenue        Decimal  @db.Decimal(14, 2)
+  transactions   Int?
+  customers      Int?
+  grossMarginPct Decimal? @db.Decimal(5, 2)
+  openDays       Int?
+  store          Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, month])
+  @@index([month])
+}
+
+enum StoreMetricKind {
+  HOURLY_TRANSACTIONS // avg transactions in the hour starting at `hour`
+  STOCKOUT_RATE_PCT
+  WASTE_VALUE
+}
+
+/// Supplementary operational metrics that not every organization collects.
+model StoreMetric {
+  id      String          @id @default(cuid())
+  storeId String
+  month   DateTime        @db.Date
+  kind    StoreMetricKind
+  hour    Int             @default(-1) // 0-23 for hourly kinds, -1 otherwise
+  value   Decimal         @db.Decimal(14, 2)
+  store   Store           @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, month, kind, hour])
+}
+
+model Category {
+  id             String           @id @default(cuid())
+  organizationId String
+  name           String
+  sortOrder      Int              @default(0)
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  metrics        CategoryMetric[]
+
+  @@unique([organizationId, name])
+}
+
+model CategoryMetric {
+  id              String   @id @default(cuid())
+  storeId         String
+  categoryId      String
+  month           DateTime @db.Date
+  revenue         Decimal  @db.Decimal(14, 2)
+  marginPct       Decimal? @db.Decimal(5, 2)
+  wasteValue      Decimal? @db.Decimal(14, 2)
+  stockoutRatePct Decimal? @db.Decimal(5, 2)
+  areaSqm         Float?
+  store           Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  category        Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, categoryId, month])
+  @@index([storeId, month])
+}
+
+enum CostType {
+  PERSONNEL
+  RENT
+  ENERGY
+  LOGISTICS
+  WASTE
+  MARKETING
+  MAINTENANCE
+  OTHER
+}
+
+model Cost {
+  id      String   @id @default(cuid())
+  storeId String
+  month   DateTime @db.Date
+  type    CostType
+  amount  Decimal  @db.Decimal(14, 2)
+  store   Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, month, type])
+  @@index([storeId, month])
+}
+
+/// Dated facts the user knows about (renovation, road works, competitor opening).
+/// Anomaly and seasonality views only cite an event when one is recorded here.
+model KnownEvent {
+  id             String       @id @default(cuid())
+  organizationId String
+  storeId        String?
+  date           DateTime     @db.Date
+  title          String
+  description    String?
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  store          Store?       @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, date])
+}
+
+// ────────────────────────────── Research & sources ─────────────────────────────
+
+enum SourceReliability {
+  OFFICIAL // government / statistical office / operator
+  COMMUNITY // e.g. OpenStreetMap
+  COMMERCIAL
+  UNKNOWN
+  DEMO // fictional source used by demo providers
+}
+
+model ResearchSource {
+  id             String            @id @default(cuid())
+  organizationId String
+  title          String
+  url            String
+  publisher      String
+  publishedAt    DateTime?
+  accessedAt     DateTime
+  excerpt        String
+  reliability    SourceReliability @default(UNKNOWN)
+  isDemo         Boolean           @default(false)
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  competitors    Competitor[]
+  signals        LocationSignal[]
+  findings       ResearchFinding[]
+
+  @@index([organizationId])
+}
+
+model Competitor {
+  id            String         @id @default(cuid())
+  storeId       String
+  name          String
+  category      String // Supermarket, Discount, Convenience, ...
+  latitude      Float?
+  longitude     Float?
+  distanceM     Int
+  openingHours  String?
+  rating        Float?
+  reviewCount   Int?
+  sourceId      String
+  lastCheckedAt DateTime
+  isDemo        Boolean        @default(false)
+  store         Store          @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  source        ResearchSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([storeId])
+}
+
+enum SignalType {
+  PUBLIC_TRANSPORT
+  PARKING
+  SCHOOL
+  UNIVERSITY
+  OFFICE
+  RESIDENTIAL
+  SHOPPING_CENTER
+  POINT_OF_INTEREST
+  POPULATION
+  DEVELOPMENT
+  ROAD_ACCESS
+}
+
+model LocationSignal {
+  id        String         @id @default(cuid())
+  storeId   String
+  type      SignalType
+  name      String
+  detail    String?
+  latitude  Float?
+  longitude Float?
+  distanceM Int?
+  sourceId  String
+  isDemo    Boolean        @default(false)
+  store     Store          @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  source    ResearchSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([storeId, type])
+}
+
+enum ResearchStatus {
+  COMPLETED
+  PARTIAL
+  UNAVAILABLE
+}
+
+model ResearchResult {
+  id             String            @id @default(cuid())
+  organizationId String
+  storeId        String?
+  query          String
+  radiusM        Int
+  provider       String // provider id that produced it, e.g. "demo" or "overpass"
+  status         ResearchStatus
+  sourcesChecked Int               @default(0)
+  isDemo         Boolean           @default(false)
+  completedAt    DateTime          @default(now())
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  store          Store?            @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  findings       ResearchFinding[]
+
+  @@index([organizationId, completedAt])
+}
+
+enum FindingKind {
+  FACT
+  OPPORTUNITY
+  RISK
+  UNKNOWN
+}
+
+model ResearchFinding {
+  id       String          @id @default(cuid())
+  resultId String
+  kind     FindingKind
+  text     String
+  sourceId String? // required for FACT (enforced in the service layer)
+  result   ResearchResult  @relation(fields: [resultId], references: [id], onDelete: Cascade)
+  source   ResearchSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  @@index([resultId])
+}
+
+// ─────────────────────── Strategies, scenarios, experiments ────────────────────
+
+enum StrategyCategory {
+  PRICING
+  ASSORTMENT
+  STORE_LAYOUT
+  OPENING_HOURS
+  STAFFING
+  MARKETING
+  CUSTOMER_RETENTION
+  CHECKOUT
+  INVENTORY
+  FOOD_WASTE
+  LOCAL_MARKETING
+  CONVENIENCE
+  SEASONAL
+  MERCHANDISING
+}
+
+enum StrategyOrigin {
+  RULE_ENGINE // deterministic rules in src/lib/strategy
+  LLM
+  USER
+}
+
+enum Confidence {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum StrategyStatus {
+  HYPOTHESIS
+  SIMULATED
+  TESTING
+  VALIDATED
+  REJECTED
+}
+
+/// A hypothesis about one store. Never a recommendation with a promised outcome.
+model Strategy {
+  id              String           @id @default(cuid())
+  organizationId  String
+  storeId         String?
+  libraryKey      String? // links to the static strategy library entry
+  ruleKey         String? // which rule produced it (for de-duplication)
+  title           String
+  category        StrategyCategory
+  origin          StrategyOrigin   @default(USER)
+  observation     String
+  locationSignal  String?
+  hypothesis      String
+  whyItMayMatter  String
+  proposedTest    String
+  assumptions     String[]
+  risks           String[]
+  metricsToWatch  String[]
+  costAssumption  Decimal?         @db.Decimal(14, 2)
+  dataConfidence  Confidence       @default(LOW)
+  confidenceNote  String?
+  status          StrategyStatus   @default(HYPOTHESIS)
+  createdAt       DateTime         @default(now())
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  store           Store?           @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  scenarios       Scenario[]
+  experiments     Experiment[]
+  opportunities   Opportunity[]
+
+  @@unique([organizationId, storeId, ruleKey])
+  @@index([organizationId])
+}
+
+enum ScenarioKind {
+  OPENING_HOURS
+  BREAK_EVEN
+  REVENUE_OPPORTUNITY
+  TRANSACTION_UPLIFT
+  COST_REDUCTION
+}
+
+enum ScenarioVariant {
+  CONSERVATIVE
+  BASE
+  OPTIMISTIC
+}
+
+/// A saved set of user assumptions. Outputs are always recomputed by the
+/// calculation engine and never stored.
+model Scenario {
+  id             String          @id @default(cuid())
+  organizationId String
+  storeId        String?
+  strategyId     String?
+  name           String
+  kind           ScenarioKind
+  /// How the three variants were derived. Shown next to the numbers; never hidden.
+  derivation     String?
+  createdAt      DateTime        @default(now())
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  store          Store?          @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  strategy       Strategy?       @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+  inputs         ScenarioInput[]
+
+  @@index([organizationId])
+}
+
+model ScenarioInput {
+  id         String          @id @default(cuid())
+  scenarioId String
+  variant    ScenarioVariant
+  key        String // input name understood by the calculator for Scenario.kind
+  value      Decimal         @db.Decimal(16, 4)
+  scenario   Scenario        @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+
+  @@unique([scenarioId, variant, key])
+}
+
+enum ExperimentStatus {
+  PLANNED
+  RUNNING
+  COMPLETED
+  STOPPED
+}
+
+enum ExperimentDecision {
+  ADOPT
+  REPEAT
+  MODIFY
+  REJECT
+  INCONCLUSIVE
+}
+
+model Experiment {
+  id             String              @id @default(cuid())
+  organizationId String
+  strategyId     String?
+  title          String
+  hypothesis     String
+  testStoreId    String
+  controlStoreId String?
+  status         ExperimentStatus    @default(PLANNED)
+  startDate      DateTime?           @db.Date
+  endDate        DateTime?           @db.Date
+  cost           Decimal?            @db.Decimal(14, 2)
+  notes          String?
+  decision       ExperimentDecision?
+  decisionNote   String?
+  isDemo         Boolean             @default(false)
+  createdAt      DateTime            @default(now())
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  strategy       Strategy?           @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+  testStore      Store               @relation("TestStore", fields: [testStoreId], references: [id], onDelete: Cascade)
+  controlStore   Store?              @relation("ControlStore", fields: [controlStoreId], references: [id], onDelete: SetNull)
+  metrics        ExperimentMetric[]
+
+  @@index([organizationId, status])
+}
+
+model ExperimentMetric {
+  id            String     @id @default(cuid())
+  experimentId  String
+  name          String
+  unit          String     @default("EUR") // EUR | count | pct
+  isPrimary     Boolean    @default(false)
+  testBefore    Decimal?   @db.Decimal(14, 2)
+  testAfter     Decimal?   @db.Decimal(14, 2)
+  controlBefore Decimal?   @db.Decimal(14, 2)
+  controlAfter  Decimal?   @db.Decimal(14, 2)
+  experiment    Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  @@index([experimentId])
+}
+
+enum OpportunityStatus {
+  NEW
+  INVESTIGATING
+  READY_TO_TEST
+  TESTING
+  VALIDATED
+  REJECTED
+  INCONCLUSIVE
+}
+
+enum Effort {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model Opportunity {
+  id                  String            @id @default(cuid())
+  organizationId      String
+  storeId             String
+  strategyId          String?
+  title               String
+  observation         String
+  hypothesis          String
+  impactScenario      String // human-readable scenario incl. the assumptions used
+  estimatedCost       Decimal?          @db.Decimal(14, 2)
+  effort              Effort            @default(MEDIUM)
+  dataConfidence      Confidence        @default(LOW)
+  suggestedExperiment String
+  status              OpportunityStatus @default(NEW)
+  createdAt           DateTime          @default(now())
+  organization        Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  store               Store             @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  strategy            Strategy?         @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+}
+
+// ─────────────────────────────────── Reports ──────────────────────────────────
+
+/// A report stores its configuration; content is rendered from live data so a
+/// report can never drift from the numbers it cites.
+model Report {
+  id             String       @id @default(cuid())
+  organizationId String
+  createdById    String
+  title          String
+  periodStart    DateTime     @db.Date
+  periodEnd      DateTime     @db.Date
+  sections       String[] // ordered section keys, see src/lib/reports/sections.ts
+  storeIds       String[] // empty = all stores
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy      User         @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
