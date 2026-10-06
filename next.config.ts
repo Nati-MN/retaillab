@@ -10,6 +10,12 @@ const securityHeaders = [
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  // The generated Prisma client reads its WASM query compiler from disk at
+  // runtime. Next's file tracing does not see that read, so serverless hosts
+  // (Vercel) would deploy without the file. Include it explicitly.
+  outputFileTracingIncludes: {
+    "/**": ["./node_modules/.prisma/client/**"],
+  },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
